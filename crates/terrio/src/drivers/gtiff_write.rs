@@ -8,6 +8,7 @@
 
 use crate::pixel::{Pixel, map_data, with_data};
 use crate::{Error, Result};
+use std::collections::HashMap;
 use std::io::Write;
 use wbraster::raster::RasterData;
 use wbraster::{DataType, Raster};
@@ -415,17 +416,18 @@ impl TiffOptions {
         let size = |key: &str| -> Result<Option<u32>> {
             co(key).map(|v| v.trim().parse::<u32>().map_err(|_| Error::InvalidArgument(format!("invalid {key} '{v}'")))).transpose()
         };
+        let overview_resampling = match options.overview_resampling.as_deref() {
+            Some(method) => OverviewResampling::parse(method)?,
+            None if cog => OverviewResampling::Average,
+            None => OverviewResampling::Nearest,
+        };
         let mut o = Self {
             compression,
             tile_size: options.tile_size,
             bigtiff: options.bigtiff || co("BIGTIFF").is_some_and(yes),
             cog,
             nodata,
-            overview_resampling: options.overview_resampling.as_deref().map(OverviewResampling::parse).transpose()?.unwrap_or(if cog {
-                OverviewResampling::Average
-            } else {
-                OverviewResampling::Nearest
-            }),
+            overview_resampling,
             band_metadata: options.band_metadata.clone(),
             color_table: options.color_table.clone(),
             geo_transform: options.geo_transform,
@@ -704,19 +706,25 @@ fn prepare(raster: &Raster, opts: &TiffOptions) -> Result<Prepared> {
     let mut levels = vec![Level::from_raster(raster)];
     if let (true, Some((t, _))) = (opts.cog, tile) {
         let t = t as usize;
-        let mut factor = 2;
-        while levels.last().is_some_and(|l| l.cols > t || l.rows > t) {
+        let (mut cols, mut rows) = (raster.cols, raster.rows);
+        let mut count = 0;
+        while cols > t || rows > t {
+            cols = cols.div_ceil(2);
+            rows = rows.div_ceil(2);
+            count += 1;
+        }
+        levels.extend(crate::par::map_range(count, |i| {
+            let factor = 1usize << (i + 1);
             let mut reducer =
                 CogOverview::new(raster.cols, raster.rows, raster.bands, factor, opts.overview_resampling, opts.nodata, opts.alpha);
             let data = reducer.write_rows(&raster.data, raster.rows);
-            levels.push(Level {
+            Level {
                 cols: raster.cols.div_ceil(factor),
                 rows: raster.rows.div_ceil(factor),
                 bands: raster.bands,
                 data: std::borrow::Cow::Owned(data),
-            });
-            factor *= 2;
-        }
+            }
+        }));
     } else if !opts.cog {
         let mut factors: Vec<usize> = opts.overviews.iter().copied().filter(|f| *f > 1).collect();
         factors.sort_unstable();
@@ -1124,7 +1132,7 @@ fn chunk_bytes<T: Pixel>(data: &[T], cols: usize, rows: usize, spp: usize, x0: u
 /// Native categorical samples must not pass through f64 (notably UInt64 above 2^53).
 struct CategoricalRow<T> {
     values: Vec<T>,
-    counts: Vec<Vec<(T, usize)>>,
+    counts: Vec<HashMap<u64, usize>>,
 }
 
 enum CategoricalSamples {
@@ -1157,6 +1165,7 @@ struct CogOverview {
 }
 
 impl CogOverview {
+    /// Creates a source-block reducer retaining only the current output row's accumulation.
     fn new(cols: usize, rows: usize, bands: usize, factor: usize, method: OverviewResampling, nodata: Option<f64>, alpha: bool) -> Self {
         let n = if method == OverviewResampling::Nearest { 0 } else { cols.div_ceil(factor) * bands };
         Self {
@@ -1174,6 +1183,8 @@ impl CogOverview {
         }
     }
 
+    /// Consumes consecutive source rows and returns band-major output rows of the same type.
+    /// Nearest emits a row when its center arrives; other methods wait for the whole block.
     fn write_rows(&mut self, data: &RasterData, rows: usize) -> RasterData {
         let out = if matches!(self.method, OverviewResampling::Nearest | OverviewResampling::Average) {
             map_data!(data, v => self.reduce(v, rows, None))
@@ -1184,7 +1195,7 @@ impl CogOverview {
                     let state = self.categorical.take().unwrap_or_else(|| {
                         CategoricalSamples::$variant(CategoricalRow {
                             values: vec![Default::default(); n],
-                            counts: if self.method == OverviewResampling::Mode { vec![Vec::new(); n] } else { Vec::new() },
+                            counts: if self.method == OverviewResampling::Mode { vec![HashMap::new(); n] } else { Vec::new() },
                         })
                     });
                     let CategoricalSamples::$variant(mut state) = state else { unreachable!("source sample type changed") };
@@ -1210,6 +1221,7 @@ impl CogOverview {
         out
     }
 
+    /// Reduces one typed slab; `received` advances only after the caller restores its state.
     fn reduce<T: Pixel + PartialOrd>(&mut self, src: &[T], rows: usize, mut categorical: Option<&mut CategoricalRow<T>>) -> Vec<T> {
         let (cols, factor, bands) = (self.cols, self.factor, self.bands);
         let out_cols = cols.div_ceil(factor);
@@ -1280,14 +1292,14 @@ impl CogOverview {
                         }
                         OverviewResampling::Mode => {
                             let state = categorical.as_mut().unwrap();
-                            let counts = &mut state.counts[k];
-                            let count = if let Some((_, n)) = counts.iter_mut().find(|(value, _)| *value == sample) {
-                                *n += 1;
-                                *n
-                            } else {
-                                counts.push((sample, 1));
-                                1
-                            };
+                            // Native bits keep integer classes exact; numeric equality groups signed zeros.
+                            let mut bytes = [0u8; 8];
+                            if v != 0.0 {
+                                sample.put_le(&mut bytes[..T::SIZE]);
+                            }
+                            let count = state.counts[k].entry(u64::from_le_bytes(bytes)).or_insert(0);
+                            *count += 1;
+                            let count = *count;
                             if count as f64 > self.weights[k] {
                                 state.values[k] = sample;
                                 self.weights[k] = count as f64;
@@ -1298,7 +1310,7 @@ impl CogOverview {
                 }
             }
             let sy = self.received + y + 1;
-            if sy % factor != 0 && sy != self.rows {
+            if !sy.is_multiple_of(factor) && sy != self.rows {
                 continue;
             }
             for b in 0..bands {
@@ -2043,7 +2055,13 @@ impl CogWriter {
 
     /// Appends the next `rows` full rows of every band (`data`: band after band, of the raster's
     /// data type).
+    ///
+    /// # Errors
+    /// Rejects a sample-type or shape mismatch before consuming rows or changing overview state.
     pub(crate) fn write_rows(&mut self, data: RasterData, rows: usize) -> Result<()> {
+        if data.data_type() != self.data_type {
+            return Err(Error::InvalidArgument("the rows are not of the raster's data type".into()));
+        }
         let l = &self.levels[0];
         if l.received + rows > l.rows {
             return Err(Error::InvalidArgument(format!("{} rows past the raster's {}", l.received + rows, l.rows)));
@@ -2059,10 +2077,10 @@ impl CogWriter {
         if rows == 0 {
             return Ok(());
         }
-        for i in 1..self.levels.len() {
-            let level = &mut self.levels[i];
-            let overview = level.overview.as_mut().unwrap().write_rows(&data, rows);
-            let overview_rows = overview.len() / (level.cols * self.bands);
+        let overviews = crate::par::map_mut(&mut self.levels[1..], |level| level.overview.as_mut().unwrap().write_rows(&data, rows));
+        for (i, overview) in overviews.into_iter().enumerate() {
+            let i = i + 1;
+            let overview_rows = overview.len() / (self.levels[i].cols * self.bands);
             if overview_rows > 0 {
                 self.push(i, overview, overview_rows)?;
             }
@@ -2448,6 +2466,25 @@ mod tests {
             assert_eq!(ds.nodata(), Some(-1.0));
             assert_eq!(ds.crs().epsg, Some(32610));
             assert_eq!(ds.geo_transform(), [500000.0, 10.0, 0.0, 4000500.0, 0.0, -10.0]);
+        }
+    }
+
+    /// Invalid slabs must fail before consuming rows or changing the native overview state.
+    #[test]
+    fn cog_row_type_errors_leave_the_writer_usable() {
+        let raster = overview_fixture(1, DataType::U8, RasterData::U8((0..65 * 35).map(|i| (i % 251) as u8).collect()));
+        let dir = tempfile::tempdir().unwrap();
+        for method in [OverviewResampling::Nearest, OverviewResampling::Average, OverviewResampling::Mode] {
+            let opts = TiffOptions { cog: true, tile_size: Some(16), overview_resampling: method, ..Default::default() };
+            let path = dir.path().join("typed.tif");
+            let mut writer = CogWriter::create(path.to_str().unwrap(), &raster, &opts).unwrap();
+            assert!(matches!(writer.write_rows(RasterData::F32(vec![1.0; 65]), 1), Err(Error::InvalidArgument(_))));
+            writer.write_rows(slice_rows(&raster.data, 35, 0..16, 65, 1), 16).unwrap();
+            assert!(matches!(writer.write_rows(RasterData::F32(vec![1.0; 65]), 1), Err(Error::InvalidArgument(_))));
+            assert!(matches!(writer.write_rows(RasterData::F32(Vec::new()), 0), Err(Error::InvalidArgument(_))));
+            writer.write_rows(slice_rows(&raster.data, 35, 16..35, 65, 1), 19).unwrap();
+            writer.finish().unwrap();
+            assert_eq!(std::fs::read(path).unwrap(), encode(&raster, &opts).unwrap(), "{method:?}");
         }
     }
 
@@ -2935,6 +2972,114 @@ mod tests {
             }
             writer.finish().unwrap();
             assert_eq!(std::fs::read(path).unwrap(), whole, "{method}");
+        }
+    }
+
+    #[test]
+    fn cog_mode_counts_high_cardinality_uint64_classes_across_slabs() {
+        let (cols, rows) = (257, 65);
+        let base = 1u64 << 63;
+        let (a, b) = (base + 1, base + 3);
+        let mut source: Vec<u64> = (0..cols * rows).map(|i| base + 1000 + i as u64).collect();
+        // Almost every sample is distinct. B reaches two first, then A reaches three first;
+        // both transitions straddle input slabs, and the final 3:3 tie must leave A winning.
+        for (x, y, value) in [(0, 0, a), (1, 0, b), (0, 15, b), (0, 16, a), (30, 31, a), (31, 31, b)] {
+            source[y * cols + x] = value;
+        }
+        let raster = Raster::from_data_native(
+            wbraster::RasterConfig { cols, rows, bands: 1, data_type: DataType::U64, ..Default::default() },
+            RasterData::U64(source.clone()),
+        )
+        .unwrap();
+        let opts = TiffOptions {
+            cog: true,
+            tile_size: Some(16),
+            compression: Compression::None,
+            overview_resampling: OverviewResampling::Mode,
+            ..Default::default()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        for step in [1, 16, 17, rows] {
+            let path = dir.path().join("mode.tif");
+            let mut writer = CogWriter::create(path.to_str().unwrap(), &raster, &opts).unwrap();
+            for y in (0..rows).step_by(step) {
+                let h = step.min(rows - y);
+                writer.write_rows(slice_rows(&raster.data, rows, y..y + h, cols, 1), h).unwrap();
+            }
+            writer.finish().unwrap();
+            let mut lazy = crate::LazyRaster::from_tiff_bytes(std::fs::read(path).unwrap()).unwrap().unwrap();
+            let dimensions = lazy.overviews();
+            assert_eq!(dimensions.last(), Some(&(9, 3)));
+            for (level, (out_cols, out_rows)) in dimensions.into_iter().enumerate() {
+                let factor = 1usize << (level + 1);
+                let overview = lazy
+                    .read_window(
+                        crate::Window::new(0, 0, out_cols, out_rows),
+                        &crate::WindowOptions { bands: vec![], overview: Some(level) },
+                    )
+                    .unwrap();
+                let RasterData::U64(actual) = overview.raster.data else { panic!("expected UInt64 overview") };
+                for y in 0..out_rows {
+                    for x in 0..out_cols {
+                        let mut counts = std::collections::BTreeMap::new();
+                        let (mut expected, mut highest) = (0, 0usize);
+                        for sy in y * factor..((y + 1) * factor).min(rows) {
+                            for sx in x * factor..((x + 1) * factor).min(cols) {
+                                let value = source[sy * cols + sx];
+                                let count = counts.entry(value).or_insert(0usize);
+                                *count += 1;
+                                if *count > highest {
+                                    expected = value;
+                                    highest = *count;
+                                }
+                            }
+                        }
+                        assert_eq!(actual[y * out_cols + x], expected, "step {step}, factor {factor}, ({x}, {y})");
+                    }
+                }
+                if factor == 32 {
+                    assert_eq!(actual[0], a, "the first class to reach three wins the tie");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn cog_float_mode_groups_signed_zeros_and_excludes_nans() {
+        let nodata = -9999.0;
+        let patterns = [
+            [1.0, -0.0, 0.0, 1.0],
+            [f64::NAN, f64::NAN, 7.0, f64::NAN],
+            [f64::NAN; 4],
+            [2.0, 2.0, -0.0, 0.0],
+            [3.0, -0.0, 0.0, f64::NAN],
+            [3.0, 0.0, -0.0, f64::NAN],
+        ];
+        let mut source = vec![f64::NAN; 65 * 35];
+        for y in 0..8 {
+            for x in 0..48 {
+                source[y * 65 + x] = patterns[x / 8][(y % 2) * 2 + x % 2];
+            }
+        }
+        for data in [RasterData::F32(source.iter().map(|&v| v as f32).collect()), RasterData::F64(source)] {
+            let data_type = data.data_type();
+            let raster = overview_fixture(1, data_type, data);
+            let options = crate::RasterWriteOptions { overview_resampling: Some("mode".into()), ..Default::default() };
+            for (factor, data) in stored_cog_overviews(&raster, options, Some(nodata)) {
+                let actual: Vec<f64> = match data {
+                    RasterData::F32(v) => v.into_iter().map(f64::from).collect(),
+                    RasterData::F64(v) => v,
+                    _ => panic!("expected floating-point overview"),
+                };
+                let out_cols = 65usize.div_ceil(factor);
+                for y in 0..35usize.div_ceil(factor) {
+                    for x in 0..out_cols {
+                        let expected: f64 =
+                            if y * factor < 8 && x * factor < 48 { [0.0, 7.0, nodata, 2.0, 0.0, -0.0][x * factor / 8] } else { nodata };
+                        assert_eq!(actual[y * out_cols + x].to_bits(), expected.to_bits(), "{data_type:?}, factor {factor}, ({x}, {y})");
+                    }
+                }
+            }
         }
     }
 
