@@ -439,12 +439,6 @@ pub(crate) fn to_proj(root: &Node) -> Option<Converted> {
             out.push("+proj=robin".into());
             push(&mut out, "lon_0", lon_0);
         }
-        // World projections of a central meridian, as terrio writes them.
-        m if super::wkt1_write::WORLD.iter().any(|(_, w)| norm(w) == m) => {
-            let (proj, _) = super::wkt1_write::WORLD.iter().find(|(_, w)| norm(w) == m)?;
-            out.push(format!("+proj={proj}"));
-            push(&mut out, "lon_0", lon_0);
-        }
         // GDAL's `satellite_height` and ESRI's `Height` (ESRI's `Option` changes nothing, and
         // its WKT cannot give a sweep axis: sweep y). Without a height, PROJ refuses the CRS.
         "geostationarysatellite" => {
@@ -488,7 +482,12 @@ pub(crate) fn to_proj(root: &Node) -> Option<Converted> {
             out.push(format!("+proj={name}"));
             push(&mut out, "lon_0", lon_0);
         }
-        _ => return None,
+        // World projections of a central meridian, as terrio writes them.
+        m => {
+            let (proj, _) = super::wkt1_write::WORLD.iter().find(|(_, w)| norm(w) == m)?;
+            out.push(format!("+proj={proj}"));
+            push(&mut out, "lon_0", lon_0);
+        }
     }
     out.push(format!("+x_0={fe}"));
     out.push(format!("+y_0={fn_}"));

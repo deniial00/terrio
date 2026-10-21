@@ -99,14 +99,15 @@ pub(crate) fn user_defined_crs(k: &GeoKeys) -> Option<wbraster::CrsInfo> {
     Some(wbraster::CrsInfo { wkt, ..crs })
 }
 
-/// A user-defined projected CRS on an EPSG geographic CRS a PROJ string does not name (OSGB36,
-/// ED50...): its WKT, whose `GEOGCS` identifies the datum and its transformations, as GDAL reads
-/// the GeoKeys. `None` for other GeoKeys.
+/// A user-defined projected CRS on an EPSG geographic CRS a PROJ string does not name exactly
+/// (OSGB36, ED50, NAD83(HARN), ETRS89...): its WKT, whose `GEOGCS` identifies the datum and its
+/// transformations, as GDAL reads the GeoKeys. `None` for other GeoKeys.
 pub(crate) fn projected_on_epsg_geographic(k: &GeoKeys) -> Option<wbraster::CrsInfo> {
     if k.short(1024) != Some(1) || esri_pe_crs(k).is_some() {
         return None;
     }
-    let code = k.short(2048).filter(|c| *c != USER_DEFINED && named_datum(Some(*c as u32 + 2000)).is_none())?;
+    // WGS 84, NAD83 and NAD27 are PROJ's `+datum=` names.
+    let code = k.short(2048).filter(|c| !matches!(*c, USER_DEFINED | 4326 | 4269 | 4267))?;
     let wkt = crate::crs::from_proj_on(&user_defined_proj4(k)?, code as u32)?;
     Some(wbraster::CrsInfo { epsg: None, wkt: Some(wkt), proj4: None })
 }
@@ -479,6 +480,21 @@ impl GeoKeyValues {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keeps_the_epsg_geographic_crs_of_a_user_defined_projection() {
+        // A transverse Mercator on NAD83(HARN) (GeographicTypeGeoKey 4152): its WKT keeps the
+        // realization, not PROJ's +datum=NAD83.
+        let keys = [
+            1, 1, 0, 11, 1024, 0, 1, 1, 2048, 0, 1, 4152, 3072, 0, 1, 32767, 3074, 0, 1, 32767, 3075, 0, 1, 1, 3076, 0, 1, 9001, 3080,
+            34736, 1, 0, 3081, 34736, 1, 1, 3082, 34736, 1, 2, 3083, 34736, 1, 3, 3092, 34736, 1, 4,
+        ];
+        let doubles = [-100.0, 0.0, 500000.0, 0.0, 0.9996];
+        let crs = user_defined_crs(&GeoKeys { keys: &keys, doubles: &doubles, ascii: "" }).unwrap();
+        let wkt = crs.wkt.unwrap();
+        assert!(crs.proj4.is_none() && wkt.contains("AUTHORITY[\"EPSG\",\"4152\"]"), "{wkt}");
+        assert!(wkt.contains("PARAMETER[\"central_meridian\",-100]"), "{wkt}");
+    }
 
     #[test]
     fn reads_gdal_user_defined_lcc() {
