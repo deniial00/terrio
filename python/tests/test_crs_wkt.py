@@ -50,6 +50,10 @@ CASES = {
     "tmerc south": (f"+proj=tmerc +axis=wsu +lon_0=29 {W}", (28.0, -26.0)),
     "utm south": (f"+proj=utm +zone=33 +south {W}", (14.0, -30.0)),
     "datum": ("+proj=utm +zone=33 +datum=WGS84 +units=m", (14.0, 30.0)),
+    "datum OSGB36": (
+        "+proj=tmerc +lat_0=49 +lon_0=-1 +k=0.9996 +x_0=400000 +y_0=-100000 +datum=OSGB36",
+        (-2.0, 53.0),
+    ),
     "lcc 2SP": (
         f"+proj=lcc +lat_1=33 +lat_2=45 +lat_0=39 +lon_0=-96 +x_0=1000 +y_0=2000 {W}",
         (-90.0, 41.0),

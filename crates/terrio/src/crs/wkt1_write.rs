@@ -158,6 +158,43 @@ pub(crate) fn describe(s: &str) -> Option<Described> {
     })
 }
 
+/// The GDAL WKT 1 of a projected PROJ string on an EPSG geographic CRS (its `GEOGCS`, which
+/// identifies the datum), as GDAL reads GeoKeys that give the geographic CRS by its code. `None`
+/// when the code is not a geographic CRS of the EPSG table, or the WKT 1 needs the PROJ string to
+/// describe the projection.
+pub(crate) fn from_proj_on(s: &str, geog: u32) -> Option<String> {
+    let e = epsg::get(geog).filter(|e| e.proj.starts_with("+proj=longlat"))?;
+    let wkt = from_proj(s).filter(|w| w.starts_with("PROJCS[") && !w.contains("EXTENSION["))?;
+    let start = wkt.find("GEOGCS[")?;
+    let mut depth = 0;
+    let end = start
+        + wkt[start..]
+            .char_indices()
+            .find(|&(_, c)| {
+                depth += match c {
+                    '[' => 1,
+                    ']' => -1,
+                    _ => 0,
+                };
+                c == ']' && depth == 0
+            })?
+            .0;
+    let mut geogcs = e.wkt.clone();
+    while let Some(i) = geogcs.find(",AXIS[") {
+        let len = geogcs[i..].find(']')?;
+        geogcs.replace_range(i..i + len + 1, "");
+    }
+    Some(format!("{}{geogcs}{}", &wkt[..start], &wkt[end + 1..]))
+}
+
+/// The ellipsoid of an EPSG geographic CRS, as PROJ parameters.
+pub(crate) fn epsg_ellipsoid(geog: u32) -> Option<String> {
+    let e = epsg::get(geog).filter(|e| e.proj.starts_with("+proj=longlat"))?;
+    const ELLIPSOID: [&str; 6] = ["+ellps=", "+a=", "+b=", "+rf=", "+f=", "+R="];
+    let tokens: Vec<&str> = e.proj.split_whitespace().filter(|t| ELLIPSOID.iter().any(|p| t.starts_with(p))).collect();
+    (!tokens.is_empty()).then(|| tokens.join(" "))
+}
+
 /// A WKT 1 with an extension node added to its root.
 fn extended(wkt: &str, extension: &str) -> String {
     format!("{},{extension}]", &wkt[..wkt.len() - 1])

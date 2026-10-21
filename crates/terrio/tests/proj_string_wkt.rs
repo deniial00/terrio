@@ -39,6 +39,7 @@ const CASES: &[(&str, (f64, f64))] = &[
     ("+proj=tmerc +axis=wsu +lon_0=29 {W}", (28.0, -26.0)),
     ("+proj=utm +zone=33 +south {W}", (14.0, -30.0)),
     ("+proj=utm +zone=33 +datum=WGS84 +units=m", (14.0, 30.0)),
+    ("+proj=tmerc +lat_0=49 +lon_0=-1 +k=0.9996 +x_0=400000 +y_0=-100000 +datum=OSGB36 +units=m", (-2.0, 53.0)),
     ("+proj=aea +lat_1=29.5 +lat_2=45.5 +lat_0=23 +lon_0=-96 +x_0=1000 +y_0=2000 {W}", (-90.0, 41.0)),
     ("+proj=eqdc +lat_1=29.5 +lat_2=45.5 +lat_0=23 +lon_0=-96 +x_0=1000 {W}", (-90.0, 41.0)),
     ("+proj=laea +lat_0=52 +lon_0=10 +x_0=1000 +y_0=2000 {W}", (12.0, 50.0)),
@@ -139,6 +140,26 @@ fn geotiff_of_a_proj_string_reads_as_the_proj_string() {
             assert!(d < 1e-3, "{p} ({j}): {d} m\n{:?}", read.to_wkt());
         }
     }
+}
+
+#[test]
+fn geotiff_of_a_wkt_on_an_epsg_datum_keeps_its_datum() {
+    // A transverse Mercator without EPSG code on ED50, whose datum terrio identifies: GeoKeys on
+    // EPSG:4230, read back with ED50's transformations.
+    let geogcs = SpatialRef::from_epsg(4230).unwrap().to_wkt().unwrap();
+    let wkt = format!(
+        "PROJCS[\"unknown\",{geogcs},PROJECTION[\"Transverse_Mercator\"],PARAMETER[\"latitude_of_origin\",0],PARAMETER[\"central_meridian\",4],PARAMETER[\"scale_factor\",0.9995],PARAMETER[\"false_easting\",300000],PARAMETER[\"false_northing\",0],UNIT[\"metre\",1]]"
+    );
+    let crs = SpatialRef { wkt: Some(wkt), ..Default::default() };
+    let cfg = RasterConfig { cols: 2, rows: 2, bands: 1, data_type: DataType::F32, crs: crs.to_crs_info(), ..Default::default() };
+    let mut ds = RasterDataset::new(terrio::Raster::from_data_native(cfg, RasterData::F32(vec![0.0; 4])).unwrap(), false);
+    ds.set_geo_transform([0.0, 1.0, 0.0, 0.0, 0.0, -1.0]);
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("ed50.tif").to_string_lossy().into_owned();
+    terrio::write_raster_dataset(&ds, &path, &Default::default()).unwrap();
+    let read = terrio::open_raster(&path).unwrap().crs();
+    let d = distance(&coords(&crs, (5.0, 50.0)), &coords(&read, (5.0, 50.0)));
+    assert!(d < 1e-3, "{d} m\n{:?}", read.to_wkt());
 }
 
 #[test]

@@ -89,6 +89,9 @@ pub(crate) fn user_defined_crs(k: &GeoKeys) -> Option<wbraster::CrsInfo> {
         1 => user_defined_proj4(k)?,
         _ => return None,
     };
+    if let Some(crs) = projected_on_epsg_geographic(k) {
+        return Some(crs);
+    }
     let crs = wbraster::CrsInfo::from_proj4(proj.trim());
     // The WKT GDAL writes for the PROJ string, which describes it whole.
     let wkt = crate::crs::SpatialRef::from_proj4(proj.trim()).ok().and_then(|s| s.wkt).or(crs.wkt);
@@ -96,26 +99,45 @@ pub(crate) fn user_defined_crs(k: &GeoKeys) -> Option<wbraster::CrsInfo> {
     Some(wbraster::CrsInfo { wkt, ..crs })
 }
 
+/// A user-defined projected CRS on an EPSG geographic CRS a PROJ string does not name (OSGB36,
+/// ED50...): its WKT, whose `GEOGCS` identifies the datum and its transformations, as GDAL reads
+/// the GeoKeys. `None` for other GeoKeys.
+pub(crate) fn projected_on_epsg_geographic(k: &GeoKeys) -> Option<wbraster::CrsInfo> {
+    if k.short(1024) != Some(1) || esri_pe_crs(k).is_some() {
+        return None;
+    }
+    let code = k.short(2048).filter(|c| *c != USER_DEFINED && named_datum(Some(*c as u32 + 2000)).is_none())?;
+    let wkt = crate::crs::from_proj_on(&user_defined_proj4(k)?, code as u32)?;
+    Some(wbraster::CrsInfo { epsg: None, wkt: Some(wkt), proj4: None })
+}
+
+/// The PROJ datum (or ellipsoid and shift) of the EPSG datums PROJ strings name.
+fn named_datum(datum: Option<u32>) -> Option<&'static str> {
+    match datum? {
+        6326 => Some("+datum=WGS84"),
+        // NAD83(HARN) as NAD83, within a metre, as GDAL's PROJ strings write it.
+        6269 | 6152 => Some("+datum=NAD83"),
+        6267 => Some("+datum=NAD27"),
+        6258 | 6283 | 6167 | 6619 => Some("+ellps=GRS80 +towgs84=0,0,0"),
+        6322 => Some("+ellps=WGS72"),
+        _ => None,
+    }
+}
+
 /// The datum or ellipsoid part of a PROJ definition.
 fn geographic_proj(k: &GeoKeys) -> Option<String> {
     let datum = match k.short(2048) {
-        Some(code) if code != USER_DEFINED => Some(code + 2000), // GCS 4326 -> datum 6326
-        _ => k.short(2050),
+        Some(code) if code != USER_DEFINED => Some(code as u32 + 2000), // GCS 4326 -> datum 6326
+        _ => k.short(2050).map(u32::from),
     };
-    let named = match datum {
-        Some(6326) => Some("+datum=WGS84"),
-        // NAD83(HARN) as NAD83, within a metre, as GDAL's PROJ strings write it.
-        Some(6269) | Some(6152) => Some("+datum=NAD83"),
-        Some(6267) => Some("+datum=NAD27"),
-        Some(6258) | Some(6283) | Some(6167) | Some(6619) => Some("+ellps=GRS80 +towgs84=0,0,0"),
-        Some(6322) => Some("+ellps=WGS72"),
-        _ => None,
-    };
-    if let Some(n) = named {
+    if let Some(n) = named_datum(datum) {
         return Some(n.to_string());
     }
-    // A known ellipsoid with a prime meridian or datum shift is user-defined below.
-    let ellipsoid = match k.short(2056).filter(|_| k.key(2061).is_none() && k.key(2062).is_none()) {
+    // The ellipsoid of another EPSG geographic CRS, when its datum cannot be named.
+    if let Some(e) = k.short(2048).filter(|c| *c != USER_DEFINED).and_then(|c| crate::crs::epsg_ellipsoid(c as u32)) {
+        return Some(e);
+    }
+    let ellipsoid = match k.short(2056) {
         Some(7030) => Some("+ellps=WGS84"),
         Some(7019) => Some("+ellps=GRS80"),
         Some(7008) => Some("+ellps=clrk66"),
@@ -124,14 +146,16 @@ fn geographic_proj(k: &GeoKeys) -> Option<String> {
         Some(7035) | Some(7047) => Some("+R=6371007.181"),
         _ => None,
     };
-    if let Some(e) = ellipsoid {
-        return Some(e.to_string());
-    }
-    let a = k.double(2057)?;
-    let mut out = match (k.double(2059), k.double(2058)) {
-        (Some(rf), _) if rf > 0.0 => format!("+a={a} +rf={rf}"),
-        (_, Some(b)) => format!("+a={a} +b={b}"),
-        _ => format!("+R={a}"),
+    let mut out = match ellipsoid {
+        Some(e) => e.to_string(),
+        None => {
+            let a = k.double(2057)?;
+            match (k.double(2059), k.double(2058)) {
+                (Some(rf), _) if rf > 0.0 => format!("+a={a} +rf={rf}"),
+                (_, Some(b)) => format!("+a={a} +b={b}"),
+                _ => format!("+R={a}"),
+            }
+        }
     };
     // GeogPrimeMeridianLongGeoKey and GeogTOWGS84GeoKey.
     if let Some(pm) = k.double(2061).filter(|pm| *pm != 0.0) {
