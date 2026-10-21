@@ -45,6 +45,16 @@ terrio::write_raster_dataset(&ds, "dem_cog.tif", &options)?;
 # Ok::<(), terrio::Error>(())
 ```
 
+`RasterWriteOptions::overview_resampling` accepts `nearest`, `average`, `min`, `max` or
+`mode` for GeoTIFF and COG. The defaults are `nearest` for GeoTIFF and `average` for COG.
+COGs build factors 2, 4, 8, … until the image fits in one tile. Each level reduces the original
+source blocks independently: `nearest` samples the block center (clamped at image edges), and
+`average` skips nodata and rounds only the final result. Categorical methods retain native
+sample precision, including UInt64 values above 2⁵³. With `ALPHA=YES`, color averages are
+weighted by the last band's alpha; alpha itself is averaged normally. Row-streamed COG output
+uses the same reduction, independently of the input row chunk size. Reading the source for each
+level costs more work than recursively reducing already-rounded overviews.
+
 `write_vector(&layers, path, &VectorWriteOptions)` writes layers; GeoPackage holds several.
 `ops::vector_filter::write_vector_with_mode` appends to or overwrites the layers of an existing
 output; GeoPackages are updated keeping their other tables.
